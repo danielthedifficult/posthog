@@ -7,10 +7,9 @@ from typing import Dict, Optional, Set
 import pytz
 
 from posthog.constants import INSIGHT_TRENDS, TRENDS_LINEAR, TRENDS_WORLD_MAP
+from posthog.demo.matrix.matrix import Cluster, Matrix
+from posthog.demo.matrix.models import SimPerson
 from posthog.models import Cohort, Dashboard, DashboardTile, Experiment, FeatureFlag, Insight, InsightViewed
-
-from ..matrix.matrix import Cluster, Matrix
-from ..matrix.models import SimPerson
 
 # This is a simulation of an online drive SaaS called Hedgebox
 # See this flowchart for the layout of the product: https://www.figma.com/file/nmvylkFx4JdTRDqyo5Vkb5/Hedgebox-Paths

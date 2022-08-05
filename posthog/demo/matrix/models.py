@@ -111,6 +111,7 @@ class SimPerson(ABC):
     _groups: Dict[str, str]
     _distinct_ids: Set[str]
     _properties: Properties
+    _end_pageview: Optional[Callable[[], None]]
 
     @abstractmethod
     def __init__(self, *, kernel: bool, cluster: "Cluster", x: int, y: int):
