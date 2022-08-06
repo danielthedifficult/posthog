@@ -101,14 +101,14 @@ class HedgeboxSessionIntent(Enum):
 
     CONSIDER_PRODUCT = auto()
     CHECK_MARIUS_TECH_TIPS_LINK = auto()
-    UPLOAD_FILE = auto()
-    DELETE_FILE = auto()
-    SEE_OWN_FILE = auto()
+    UPLOAD_FILE_S = auto()
+    DELETE_FILE_S = auto()
+    DOWNLOAD_OWN_FILE_S = auto()
     SHARE_FILE = auto()
-    SEE_SHARED_FILE = auto()
+    VIEW_SHARED_FILE = auto()
     INVITE_TEAM_MEMBER = auto()
     REMOVE_TEAM_MEMBER = auto()
-    JOIN_FROM_INVITE = auto()
+    JOIN_TEAM = auto()
     UPGRADE_PLAN = auto()
     DOWNGRADE_PLAN = auto()
 
@@ -201,6 +201,7 @@ class HedgeboxPerson(SimPerson):
     _referrer: Optional[HedgeboxReferrer]
     _received_invite_id: Optional[str]
     _received_file_id: Optional[str]
+    _current_session_intent: Optional[HedgeboxSessionIntent]
 
     # Internal state - bounded
     _need: float  # 0 means no need, 1 means desperate
@@ -276,25 +277,62 @@ class HedgeboxPerson(SimPerson):
     # Abstract methods
 
     def _fast_forward_to_next_session(self):
+        next_session_datetime = self._simulation_time
         while True:
-            self._simulation_time += dt.timedelta(
+            next_session_datetime += dt.timedelta(
                 seconds=self.cluster.random.betavariate(2.5, 1 + self.need)
                 * (36_000 if self.has_signed_up else 172_800)
-                + 24
+                + 24,
             )
             time_appropriateness: float
             # Check if it's night
-            if 5 < self._simulation_time.hour < 23:
+            if 5 < next_session_datetime.hour < 23:
                 time_appropriateness = 0.1
             # Check if it's 9 to 5 on a work day
-            elif self._simulation_time.weekday() <= 5 and 9 <= self._simulation_time.hour <= 17:
+            elif next_session_datetime.weekday() <= 5 and 9 <= next_session_datetime.hour <= 17:
                 # Business users most likely to be active during the work day, personal users just the opposite
                 time_appropriateness = 1 if self.cluster.company_name else 0.3
             else:
                 time_appropriateness = 0.2 if self.cluster.company_name else 1
 
             if self.cluster.random.random() < time_appropriateness:
-                return  # If the time is right, let's act - otherwise, let's advance further
+                return next_session_datetime  # If the time is right, let's act - otherwise, let's advance further
+
+    def _determine_session_intent(self) -> HedgeboxSessionIntent:
+        possible_intents_with_weights: List[Tuple[HedgeboxSessionIntent, float]]
+        if self._received_invite_id:
+            possible_intents_with_weights = [(HedgeboxSessionIntent.JOIN_TEAM, 1)]
+        elif self._received_file_id:
+            possible_intents_with_weights = [(HedgeboxSessionIntent.VIEW_SHARED_FILE, 1)]
+        elif not self.has_signed_up:
+            possible_intents_with_weights = [
+                (HedgeboxSessionIntent.CONSIDER_PRODUCT, 10),
+                (HedgeboxSessionIntent.CHECK_MARIUS_TECH_TIPS_LINK, 1),
+            ]
+        else:
+            account = cast(HedgeboxAccount, self.account)  # Must be set in this branch
+            file_count = len(account.files)
+            possible_intents_with_weights = [
+                (HedgeboxSessionIntent.UPLOAD_FILE_S, 1),
+                # The more files, the more likely to go to delete/download/share rather than upload
+                (HedgeboxSessionIntent.DELETE_FILE_S, math.log10(file_count) / 8 if file_count else 0),
+                (HedgeboxSessionIntent.DOWNLOAD_OWN_FILE_S, math.log10(file_count + 1) if file_count else 0),
+                (HedgeboxSessionIntent.SHARE_FILE, math.log10(file_count) / 3 if file_count else 0),
+            ]
+            if self.satisfaction > 0.5 and account.plan.higher_plan:
+                possible_intents_with_weights.append((HedgeboxSessionIntent.UPGRADE_PLAN, 0.1))
+            elif self.satisfaction < -0.5 and account.plan.lower_plan:
+                possible_intents_with_weights.append((HedgeboxSessionIntent.DOWNGRADE_PLAN, 0.1))
+            if account.plan.is_business and len(self.cluster.people) > 1:
+                if len(account.team_members) < len(self.cluster.people):
+                    possible_intents_with_weights.append((HedgeboxSessionIntent.INVITE_TEAM_MEMBER, 0.2))
+                if len(account.team_members) > 1:
+                    possible_intents_with_weights.append((HedgeboxSessionIntent.REMOVE_TEAM_MEMBER, 0.025))
+
+        possible_intents, weights = zip(*possible_intents_with_weights)
+        return self.cluster.random.choices(
+            cast(Tuple[HedgeboxSessionIntent], possible_intents), cast(Tuple[float], weights)
+        )[0]
 
     def _simulate_session(self):
         if (
@@ -310,65 +348,30 @@ class HedgeboxPerson(SimPerson):
                 },
             )
 
-        possible_intents_with_weights: List[Tuple[HedgeboxSessionIntent, float]]
-        if self._received_invite_id:
-            possible_intents_with_weights = [(HedgeboxSessionIntent.JOIN_FROM_INVITE, 1)]
-        elif self._received_file_id:
-            possible_intents_with_weights = [(HedgeboxSessionIntent.SEE_SHARED_FILE, 1)]
-        elif not self.has_signed_up:
-            possible_intents_with_weights = [
-                (HedgeboxSessionIntent.CONSIDER_PRODUCT, 10),
-                (HedgeboxSessionIntent.CHECK_MARIUS_TECH_TIPS_LINK, 1),
-            ]
-        else:
-            account = cast(HedgeboxAccount, self.account)  # Must be set in this branch
-            file_count = len(account.files)
-            possible_intents_with_weights = [
-                (HedgeboxSessionIntent.UPLOAD_FILE, 1),
-                # The more files, the more likely to go to delete/download/share rather than upload
-                (HedgeboxSessionIntent.DELETE_FILE, math.log10(file_count) / 8 if file_count else 0),
-                (HedgeboxSessionIntent.SEE_OWN_FILE, math.log10(file_count + 1) if file_count else 0),
-                (HedgeboxSessionIntent.SHARE_FILE, math.log10(file_count) / 3 if file_count else 0),
-            ]
-            if self.satisfaction > 0.5 and account.plan.higher_plan:
-                possible_intents_with_weights.append((HedgeboxSessionIntent.UPGRADE_PLAN, 0.1))
-            elif self.satisfaction < -0.5 and account.plan.lower_plan:
-                possible_intents_with_weights.append((HedgeboxSessionIntent.DOWNGRADE_PLAN, 0.1))
-            if account.plan.is_business and len(self.cluster.people) > 1:
-                if len(account.team_members) < len(self.cluster.people):
-                    possible_intents_with_weights.append((HedgeboxSessionIntent.INVITE_TEAM_MEMBER, 0.2))
-                if len(account.team_members) > 1:
-                    possible_intents_with_weights.append((HedgeboxSessionIntent.REMOVE_TEAM_MEMBER, 0.025))
-
-        possible_intents, weights = zip(*possible_intents_with_weights)
-        main_session_intent = self.cluster.random.choices(
-            cast(Tuple[HedgeboxSessionIntent], possible_intents), cast(Tuple[float], weights)
-        )[0]
-
-        if main_session_intent == HedgeboxSessionIntent.CONSIDER_PRODUCT:
+        if self._current_session_intent == HedgeboxSessionIntent.CONSIDER_PRODUCT:
             self._consider_product()
-        elif main_session_intent == HedgeboxSessionIntent.CHECK_MARIUS_TECH_TIPS_LINK:
+        elif self._current_session_intent == HedgeboxSessionIntent.CHECK_MARIUS_TECH_TIPS_LINK:
             self._check_marius_tech_tips_link()
-        elif main_session_intent == HedgeboxSessionIntent.UPLOAD_FILE:
+        elif self._current_session_intent == HedgeboxSessionIntent.UPLOAD_FILE_S:
             self._upload_file()
-        elif main_session_intent == HedgeboxSessionIntent.DELETE_FILE:
+        elif self._current_session_intent == HedgeboxSessionIntent.DELETE_FILE_S:
             self._delete_file()
-        elif main_session_intent == HedgeboxSessionIntent.SEE_OWN_FILE:
+        elif self._current_session_intent == HedgeboxSessionIntent.DOWNLOAD_OWN_FILE_S:
             self._see_own_file()
-        elif main_session_intent == HedgeboxSessionIntent.SHARE_FILE:
+        elif self._current_session_intent == HedgeboxSessionIntent.SHARE_FILE:
             self._share_file()
-        elif main_session_intent == HedgeboxSessionIntent.SEE_SHARED_FILE:
+        elif self._current_session_intent == HedgeboxSessionIntent.VIEW_SHARED_FILE:
             self._see_shared_file()
-        elif main_session_intent == HedgeboxSessionIntent.INVITE_TEAM_MEMBER:
+        elif self._current_session_intent == HedgeboxSessionIntent.INVITE_TEAM_MEMBER:
             self._invite_team_member()
-        elif main_session_intent == HedgeboxSessionIntent.REMOVE_TEAM_MEMBER:
+        elif self._current_session_intent == HedgeboxSessionIntent.REMOVE_TEAM_MEMBER:
             self._remove_team_member()
-        elif main_session_intent == HedgeboxSessionIntent.UPGRADE_PLAN:
+        elif self._current_session_intent == HedgeboxSessionIntent.UPGRADE_PLAN:
             self._upgrade_plan()
-        elif main_session_intent == HedgeboxSessionIntent.DOWNGRADE_PLAN:
+        elif self._current_session_intent == HedgeboxSessionIntent.DOWNGRADE_PLAN:
             self._downgrade_plan()
         else:
-            raise ValueError(f"Unknown session intent: {main_session_intent}")
+            raise ValueError(f"Unknown session intent: {self._current_session_intent}")
 
     # Page visits
 

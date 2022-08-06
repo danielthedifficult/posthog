@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
+from enum import Enum
 from itertools import chain
 from typing import (
     TYPE_CHECKING,
@@ -41,6 +42,14 @@ PROPERTY_GEOIP_COUNTRY_CODE = "$geoip_country_code"
 Properties = Dict[str, Any]
 SP = TypeVar("SP", bound="SimPerson")
 Effect = Callable[[SP], Any]
+
+
+class SimSessionIntent(Enum):
+    """An enumeration of session intents.
+
+    An intent is determined for each session a user starts, and it dictates their behavior during that session."""
+
+    pass
 
 
 @dataclass
@@ -166,7 +175,8 @@ class SimPerson(ABC):
         self._super_properties = {}
         self._distinct_ids.add(self._active_client.device_id)
         while self._simulation_time <= self.cluster.end:
-            self._fast_forward_to_next_session()
+            self._simulation_time = self._fast_forward_to_next_session()
+            self._current_session_intent = self._determine_session_intent()
             self._apply_due_effects()
             self._active_client.start_session(str(self.roll_uuidt()))
             self._simulate_session()
@@ -183,8 +193,13 @@ class SimPerson(ABC):
     # Abstract methods
 
     @abstractmethod
-    def _fast_forward_to_next_session(self):
+    def _fast_forward_to_next_session(self) -> dt.datetime:
         """Intelligently advance timer to the time of the next session."""
+        raise NotImplementedError()
+
+    @abstractmethod
+    def _determine_session_intent(self) -> SimSessionIntent:
+        """Determine the session intent for the session that's about to start."""
         raise NotImplementedError()
 
     @abstractmethod
