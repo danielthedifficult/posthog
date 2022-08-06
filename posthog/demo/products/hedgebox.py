@@ -1,8 +1,9 @@
 import datetime as dt
+import math
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum, auto
-from typing import Dict, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple, cast
 
 import pytz
 
@@ -12,7 +13,20 @@ from posthog.demo.matrix.models import SimPerson
 from posthog.models import Cohort, Dashboard, DashboardTile, Experiment, FeatureFlag, Insight, InsightViewed
 
 # This is a simulation of an online drive SaaS called Hedgebox
-# See this flowchart for the layout of the product: https://www.figma.com/file/nmvylkFx4JdTRDqyo5Vkb5/Hedgebox-Paths
+# See this RFC for the reasoning behind it:
+# https://github.com/PostHog/product-internal/blob/main/requests-for-comments/2022-03-23-great-demo-data.md
+
+# Simulation features:
+# - the product is used by lots of personal users, but businesses bring the most revenue
+# - most users are from the US, but there are blips all over the world
+# - timezones are accurate on the country level
+# - usage times are accurate taking into account time of day, timezone, and user profile (personal or business)
+# - Hedgebox is sponsoring the well-known YouTube channel about technology Marius Tech Tips - there's a landing page
+# - an experiment with a new signup page is running, and it's showing positive results
+# - Internet Explorer users do worse
+
+# See this flowchart for the layout of the product:
+# https://www.figma.com/file/nmvylkFx4JdTRDqyo5Vkb5/Hedgebox-Paths
 
 PRODUCT_NAME = "Hedgebox"
 
@@ -82,11 +96,50 @@ class HedgeboxReferrer(Enum):
     MARIUS_TECH_TIPS = auto()
 
 
+class HedgeboxSessionIntent(Enum):
+    """What the user has in mind for the current session."""
+
+    CONSIDER_PRODUCT = auto()
+    CHECK_MARIUS_TECH_TIPS_LINK = auto()
+    UPLOAD_FILE = auto()
+    DELETE_FILE = auto()
+    SEE_OWN_FILE = auto()
+    SHARE_FILE = auto()
+    SEE_SHARED_FILE = auto()
+    INVITE_TEAM_MEMBER = auto()
+    REMOVE_TEAM_MEMBER = auto()
+    JOIN_FROM_INVITE = auto()
+    UPGRADE_PLAN = auto()
+    DOWNGRADE_PLAN = auto()
+
+
 class HedgeboxPlan(str, Enum):
     PERSONAL_FREE = "personal/free"
     PERSONAL_PRO = "personal/pro"
     BUSINESS_STANDARD = "business/standard"
     BUSINESS_ENTERPRISE = "business/enterprise"
+
+    @property
+    def is_business(self) -> bool:
+        return self.startswith("business/")
+
+    @property
+    def higher_plan(self) -> Optional["HedgeboxPlan"]:
+        if self == HedgeboxPlan.PERSONAL_FREE:
+            return HedgeboxPlan.PERSONAL_PRO
+        elif self == HedgeboxPlan.BUSINESS_STANDARD:
+            return HedgeboxPlan.BUSINESS_ENTERPRISE
+        else:
+            return None
+
+    @property
+    def lower_plan(self) -> Optional["HedgeboxPlan"]:
+        if self == HedgeboxPlan.PERSONAL_PRO:
+            return HedgeboxPlan.PERSONAL_FREE
+        elif self == HedgeboxPlan.BUSINESS_ENTERPRISE:
+            return HedgeboxPlan.BUSINESS_STANDARD
+        else:
+            return None
 
 
 @dataclass
@@ -118,6 +171,10 @@ class HedgeboxAccount:
             raise ValueError(f"Unknown plan: {self.plan}")
 
     @property
+    def current_used_mb(self) -> int:
+        return sum(file.size_b for file in self.files.values())
+
+    @property
     def current_monthly_bill_usd(self) -> Decimal:
         if self.plan == HedgeboxPlan.PERSONAL_FREE:
             return Decimal("0.00")
@@ -138,9 +195,12 @@ class HedgeboxPerson(SimPerson):
     person_id: str
     name: str
     email: str
+    affinity: float  # 0 roughly means they won't like Hedgebox, 1 means they will
 
     # Internal state - plain
     _referrer: Optional[HedgeboxReferrer]
+    _received_invite_id: Optional[str]
+    _received_file_id: Optional[str]
 
     # Internal state - bounded
     _need: float  # 0 means no need, 1 means desperate
@@ -152,15 +212,22 @@ class HedgeboxPerson(SimPerson):
         self.person_id = self.cluster.random.randstr(False, 16)
         self.name = self.cluster.person_provider.full_name()
         self.email = self.cluster.person_provider.email()
+        self.affinity = (
+            self.cluster.random.betavariate(1.8, 1.2)
+            if self._active_client.browser != "Internet Explorer"
+            else self.cluster.random.betavariate(1, 1.4)
+        )
         self._referrer = None
-        self._need = self.cluster.random.uniform(0.6 if self.kernel else 0, 1 if self.kernel else 0.3)
+        self._received_invite_id = None
+        self._received_file_id = None
+        self._need = self.cluster.random.uniform(0.6 if self.kernel else 0, 1 if self.kernel else 0.2)
         self._satisfaction = 0.0
         self._personal_account = None
         while True:
+            self.country_code = (
+                "US" if self.cluster.random.random() < 0.9132 else self.cluster.address_provider.country_code()
+            )
             try:  # Some tiny regions aren't in pytz - we want to omit those
-                self.country_code = (
-                    "US" if self.cluster.random.random() < 0.9132 else self.cluster.address_provider.country_code()
-                )
                 self.timezone = self.cluster.random.choice(pytz.country_timezones[self.country_code])
             except KeyError:
                 continue
@@ -227,7 +294,7 @@ class HedgeboxPerson(SimPerson):
                 time_appropriateness = 0.2 if self.cluster.company_name else 1
 
             if self.cluster.random.random() < time_appropriateness:
-                return  # If the time is right, let's go to simulation - otherwise, let's advance further
+                return  # If the time is right, let's act - otherwise, let's advance further
 
     def _simulate_session(self):
         if (
@@ -243,9 +310,67 @@ class HedgeboxPerson(SimPerson):
                 },
             )
 
-        # TODO: Simulate paths
+        possible_intents_with_weights: List[Tuple[HedgeboxSessionIntent, float]]
+        if self._received_invite_id:
+            possible_intents_with_weights = [(HedgeboxSessionIntent.JOIN_FROM_INVITE, 1)]
+        elif self._received_file_id:
+            possible_intents_with_weights = [(HedgeboxSessionIntent.SEE_SHARED_FILE, 1)]
+        elif not self.has_signed_up:
+            possible_intents_with_weights = [
+                (HedgeboxSessionIntent.CONSIDER_PRODUCT, 10),
+                (HedgeboxSessionIntent.CHECK_MARIUS_TECH_TIPS_LINK, 1),
+            ]
+        else:
+            account = cast(HedgeboxAccount, self.account)  # Must be set in this branch
+            file_count = len(account.files)
+            possible_intents_with_weights = [
+                (HedgeboxSessionIntent.UPLOAD_FILE, 1),
+                # The more files, the more likely to go to delete/download/share rather than upload
+                (HedgeboxSessionIntent.DELETE_FILE, math.log10(file_count) / 8 if file_count else 0),
+                (HedgeboxSessionIntent.SEE_OWN_FILE, math.log10(file_count + 1) if file_count else 0),
+                (HedgeboxSessionIntent.SHARE_FILE, math.log10(file_count) / 3 if file_count else 0),
+            ]
+            if self.satisfaction > 0.5 and account.plan.higher_plan:
+                possible_intents_with_weights.append((HedgeboxSessionIntent.UPGRADE_PLAN, 0.1))
+            elif self.satisfaction < -0.5 and account.plan.lower_plan:
+                possible_intents_with_weights.append((HedgeboxSessionIntent.DOWNGRADE_PLAN, 0.1))
+            if account.plan.is_business and len(self.cluster.people) > 1:
+                if len(account.team_members) < len(self.cluster.people):
+                    possible_intents_with_weights.append((HedgeboxSessionIntent.INVITE_TEAM_MEMBER, 0.2))
+                if len(account.team_members) > 1:
+                    possible_intents_with_weights.append((HedgeboxSessionIntent.REMOVE_TEAM_MEMBER, 0.025))
 
-    # Individual flows
+        possible_intents, weights = zip(*possible_intents_with_weights)
+        main_session_intent = self.cluster.random.choices(
+            cast(Tuple[HedgeboxSessionIntent], possible_intents), cast(Tuple[float], weights)
+        )[0]
+
+        if main_session_intent == HedgeboxSessionIntent.CONSIDER_PRODUCT:
+            self._consider_product()
+        elif main_session_intent == HedgeboxSessionIntent.CHECK_MARIUS_TECH_TIPS_LINK:
+            self._check_marius_tech_tips_link()
+        elif main_session_intent == HedgeboxSessionIntent.UPLOAD_FILE:
+            self._upload_file()
+        elif main_session_intent == HedgeboxSessionIntent.DELETE_FILE:
+            self._delete_file()
+        elif main_session_intent == HedgeboxSessionIntent.SEE_OWN_FILE:
+            self._see_own_file()
+        elif main_session_intent == HedgeboxSessionIntent.SHARE_FILE:
+            self._share_file()
+        elif main_session_intent == HedgeboxSessionIntent.SEE_SHARED_FILE:
+            self._see_shared_file()
+        elif main_session_intent == HedgeboxSessionIntent.INVITE_TEAM_MEMBER:
+            self._invite_team_member()
+        elif main_session_intent == HedgeboxSessionIntent.REMOVE_TEAM_MEMBER:
+            self._remove_team_member()
+        elif main_session_intent == HedgeboxSessionIntent.UPGRADE_PLAN:
+            self._upgrade_plan()
+        elif main_session_intent == HedgeboxSessionIntent.DOWNGRADE_PLAN:
+            self._downgrade_plan()
+        else:
+            raise ValueError(f"Unknown session intent: {main_session_intent}")
+
+    # Page visits
 
     def _visit_home(self):
         self._capture_pageview(URL_HOME)
@@ -266,21 +391,27 @@ class HedgeboxPerson(SimPerson):
         self._advance_timer(1.2 + self.cluster.random.betavariate(1.5, 2) * 200)  # Viewing the page
 
     def _visit_sign_up(self):
-        """Go through sign-up flow and return True if the user signed up."""
         if self.cluster.company_name and not self.kernel:
-            raise Exception("Only the kernel can sign up in a company cluster")
+            raise ValueError("Only the kernel can sign up in a company cluster")
+
         self._capture_pageview(URL_SIGNUP)  # Visiting the sign-up page
+
+        if self.has_signed_up:  # Signed up already!
+            self._advance_timer(5 + self.cluster.random.betavariate(2, 1.3) * 19)
+            return self._visit_login()
+
         # Signup is faster with the new signup page
         is_on_new_signup_page = self._super_properties.get(PROPERTY_NEW_SIGNUP_PAGE_FLAG) == "test"
+        success_rate = SIGNUP_SUCCESS_RATE_TEST if is_on_new_signup_page else SIGNUP_SUCCESS_RATE_CONTROL
+        # What's the outlook?
+        success = self.cluster.random.random() < success_rate
         self._advance_timer(
-            9 + self.cluster.random.betavariate(1.2, 2) * (120 if is_on_new_signup_page else 170)
+            9 + self.cluster.random.betavariate(1.2, 2) * (60 if not success else 120 if is_on_new_signup_page else 170)
         )  # Looking at things, filling out forms
         # More likely to finish signing up with the new signup page
-        success_rate = SIGNUP_SUCCESS_RATE_TEST if is_on_new_signup_page else SIGNUP_SUCCESS_RATE_CONTROL
-        success = self.cluster.random.random() < success_rate  # What's the outlook?
         if success:  # Let's do this!
             self.account = HedgeboxAccount(id=str(self.roll_uuidt()), team_members={self})  # TODO: Add billing
-            self._capture(EVENT_SIGNED_UP, {"from_invite": False}, current_url="https://hedgebox.net/register/")
+            self._capture(EVENT_SIGNED_UP, {"from_invite": False})
             self._advance_timer(self.cluster.random.uniform(0.1, 0.2))
             self._identify(self.person_id, {"email": self.email, "name": self.name})
             self._group(
@@ -298,7 +429,22 @@ class HedgeboxPerson(SimPerson):
             self.satisfaction += (self.cluster.random.betavariate(1, 3) - 0.75) * 0.5
 
     def _visit_login(self):
-        pass  # TODO
+        if self.cluster.company_name and not self.kernel:
+            raise ValueError("Only the kernel can sign up in a company cluster")
+
+        self._capture_pageview(URL_LOGIN)
+
+        if not self.has_signed_up:  # Not signed up yet!
+            self._advance_timer(3 + self.cluster.random.betavariate(1.4, 1.2) * 14)
+            return self._visit_sign_up()
+
+        success = self.cluster.random.random() < 0.95  # There's always a tiny chance the user will resign
+        self._advance_timer(2 + self.cluster.random.betavariate(1.2, 1.2) * (29 if success else 17))
+
+        if success:
+            self._capture(EVENT_LOGGED_IN)
+            self._advance_timer(self.cluster.random.uniform(0.1, 0.2))
+            self._identify(self.person_id)
 
     def _visit_invite(self, invite_id: str):
         pass  # TODO
@@ -322,21 +468,48 @@ class HedgeboxPerson(SimPerson):
     def _visit_account_team(self):
         pass  # TODO
 
-    def _consider_uploading_files(self):
+    # Intent flows
+
+    def _consider_product(self):
+        pass  # TODO
+
+    def _check_marius_tech_tips_link(self):
+        pass  # TODO
+
+    def _upload_file(self):
         self._advance_timer(self.cluster.random.betavariate(2.5, 1.1) * 95)
         file_count = self.cluster.random.randint(1, 13)
         for _ in range(file_count):
             self._capture(
-                EVENT_UPLOADED_FILE,
-                current_url="https://hedgebox.net/my_files/",
-                properties={"file_extension": self.cluster.file_provider.extension(),},
+                EVENT_UPLOADED_FILE, properties={"file_extension": self.cluster.file_provider.extension(),},
             )
         self.satisfaction += self.cluster.random.uniform(-0.19, 0.2)
         if self.satisfaction > 0.9:
             self._affect_neighbors(lambda other: other._move_needle("need", 0.05))
 
-    def _share_file_link(self):
+    def _delete_file(self):
+        pass  # TODO
+
+    def _see_own_file(self):
+        pass  # TODO
+
+    def _share_file(self):
         self._capture(EVENT_SHARED_FILE_LINK)  # TODO
+
+    def _see_shared_file(self):
+        pass  # TODO
+
+    def _invite_team_member(self):
+        pass  # TODO
+
+    def _remove_team_member(self):
+        pass  # TODO
+
+    def _upgrade_plan(self):
+        pass  # TODO
+
+    def _downgrade_plan(self):
+        pass  # TODO
 
 
 class HedgeboxCluster(Cluster):
@@ -358,7 +531,7 @@ class HedgeboxCluster(Cluster):
         self._business_account = None
 
     def __str__(self) -> str:
-        return self.company_name or f"social circle {self.index+1}"
+        return self.company_name or f"Social Circle #{self.index+1}"
 
     def _radius_distribution(self) -> int:
         return int(self.MIN_RADIUS + self.random.betavariate(1.5, 5) * (self.MAX_RADIUS - self.MIN_RADIUS))
@@ -376,7 +549,7 @@ class HedgeboxMatrix(Matrix):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Start new signup page experiment roughly halfway through the simulation, end late into it
+        # Start new signup page experiment roughly halfway through the simulation, end soon before `now`
         self.new_signup_page_experiment_end = self.now - dt.timedelta(days=2, hours=3, seconds=43)
         self.new_signup_page_experiment_start = self.start + (self.new_signup_page_experiment_end - self.start) / 2
 

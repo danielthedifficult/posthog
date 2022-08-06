@@ -1,5 +1,6 @@
 import datetime as dt
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
 from itertools import chain
@@ -7,10 +8,12 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    DefaultDict,
     Deque,
     Dict,
     Iterable,
     List,
+    Literal,
     Optional,
     Set,
     Tuple,
@@ -105,18 +108,16 @@ class SimPerson(ABC):
 
     # Internal state
     _simulation_time: dt.datetime  # Current simulation time, populated by running .simulate()
-    _active_client: SimWebClient  # Client used by person, populated by running .simulate()
+    _active_client: SimWebClient  # Client used by person
     _super_properties: Properties
-    _end_pageview: Optional[Callable[[], None]]
     _groups: Dict[str, str]
     _distinct_ids: Set[str]
     _properties: Properties
-    _end_pageview: Optional[Callable[[], None]]
+    _current_pageview_kwargs: Optional[Dict[str, Any]]
+    _pageview_count: DefaultDict[str, int]
 
     @abstractmethod
     def __init__(self, *, kernel: bool, cluster: "Cluster", x: int, y: int):
-        self._distinct_ids = set()
-        self._properties = {}
         self.past_events = []
         self.future_events = []
         self.scheduled_effects = Deque()
@@ -124,6 +125,15 @@ class SimPerson(ABC):
         self.cluster = cluster
         self.x = x
         self.y = y
+        device_type, os, browser = self.cluster.properties_provider.device_type_os_browser()
+        self._active_client = SimWebClient(
+            device_id=str(UUID(int=self.cluster.random.getrandbits(128))),
+            device_type=device_type,
+            os=os,
+            browser=browser,
+        )
+        self._distinct_ids = set()
+        self._properties = {}
 
     def __str__(self) -> str:
         """Return person ID. Overriding this is recommended but optional."""
@@ -150,14 +160,8 @@ class SimPerson(ABC):
         if hasattr(self, "simulation_time"):
             raise Exception(f"Person {self} already has been simulated")
         self._simulation_time = self.cluster.start.astimezone(pytz.timezone(self.timezone))
-        self._end_pageview = None
-        device_type, os, browser = self.cluster.properties_provider.device_type_os_browser()
-        self._active_client = SimWebClient(
-            device_id=str(UUID(int=self.cluster.random.getrandbits(128))),
-            device_type=device_type,
-            os=os,
-            browser=browser,
-        )
+        self._current_pageview_kwargs = None
+        self._pageview_counts = defaultdict(int)
         self._groups = {}
         self._super_properties = {}
         self._distinct_ids.add(self._active_client.device_id)
@@ -166,9 +170,9 @@ class SimPerson(ABC):
             self._apply_due_effects()
             self._active_client.start_session(str(self.roll_uuidt()))
             self._simulate_session()
-            if self._end_pageview is not None:  # Let's assume the page is always left at the end
-                self._end_pageview()
-                self._end_pageview = None
+            if self._current_pageview_kwargs is not None:  # Let's assume the page is always left at the end
+                self._capture(EVENT_PAGELEAVE, **self._current_pageview_kwargs)
+                self._current_pageview_kwargs = None
 
     def schedule_effect(self, timestamp: dt.datetime, effect: Effect):
         """Schedule an effect to apply at a given time.
@@ -201,9 +205,15 @@ class SimPerson(ABC):
 
     # Person state
 
-    def _move_needle(self, attr: str, delta: float):
-        """Move the person's property by the given delta. Useful for defining effects."""
+    def _set_attribute(self, attr: str, value: Any) -> Literal[True]:
+        """Set the person's attribute. Useful for defining effects. Chain with `and`."""
+        setattr(self, attr, value)
+        return True
+
+    def _move_needle(self, attr: str, delta: float) -> Literal[True]:
+        """Move the person's attribute by the given delta. Useful for defining effects. Chain with `and`."""
         setattr(self, attr, getattr(self, attr) + delta)
+        return True
 
     def _apply_due_effects(self):
         while True:
@@ -224,12 +234,7 @@ class SimPerson(ABC):
     # Analyics
 
     def _capture(
-        self,
-        event: str,
-        properties: Optional[Properties] = None,
-        *,
-        current_url: Optional[str] = None,
-        referrer: Optional[str] = None,
+        self, event: str, properties: Optional[Properties] = None, *, referrer: Optional[str] = None,
     ):
         """Capture an arbitrary event. Similar to JS `posthog.capture()`."""
         if self._simulation_time > self.cluster.now:
@@ -254,7 +259,8 @@ class SimPerson(ABC):
         }
         if self._super_properties:
             combined_properties.update(self._super_properties)
-        if current_url:
+        if self._current_pageview_kwargs is not None:
+            current_url = self._current_pageview_kwargs["current_url"]
             parsed_current_url = urlparse(current_url)
             combined_properties["$current_url"] = current_url
             combined_properties["$host"] = parsed_current_url.netloc
@@ -289,11 +295,12 @@ class SimPerson(ABC):
         self, current_url: str, properties: Optional[Properties] = None, *, referrer: Optional[str] = None
     ):
         """Capture a $pageview event. $pageleave is handled implicitly."""
-        if self._end_pageview is not None:
-            self._end_pageview()
+        self._pageview_counts[current_url] += 1
+        if self._current_pageview_kwargs is not None:
+            self._capture(EVENT_PAGELEAVE, **self._current_pageview_kwargs)
         self._advance_timer(self.cluster.random.uniform(0.05, 0.3))  # A page doesn't load instantly
-        self._capture(EVENT_PAGEVIEW, properties, current_url=current_url, referrer=referrer)
-        self._end_pageview = lambda: self._capture(EVENT_PAGELEAVE, current_url=current_url, referrer=referrer)
+        self._current_pageview_kwargs = dict(current_url=current_url, referrer=referrer)
+        self._capture(EVENT_PAGEVIEW, properties, referrer=referrer)
 
     def _identify(self, distinct_id: Optional[str], set_properties: Optional[Properties] = None):
         """Identify person in active client. Similar to JS `posthog.identify()`.

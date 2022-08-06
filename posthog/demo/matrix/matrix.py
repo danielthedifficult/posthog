@@ -110,10 +110,11 @@ class Cluster(ABC):
 
     def _print_simulation_update(self, person_spiral_index: int, person: SimPerson):
         print(
-            f"Simulated person {person_spiral_index + 1} in cluster {self} ({len(person.past_events)} event{'' if len(person.past_events) == 1 else 's'}):"
+            f"Simulated person {person_spiral_index + 1} in cluster {self} ({len(person.past_events)} event{'' if len(person.past_events) == 1 else 's'}):",
+            flush=False,
         )
         for person_row in self.people_matrix:
-            print(" ".join(("X" if hasattr(person, "_simulation_time") else "-" for person in person_row)))
+            print(" ".join(("X" if hasattr(person, "_simulation_time") else "-" for person in person_row)), flush=False)
 
     @property
     def people(self) -> List[SimPerson]:
