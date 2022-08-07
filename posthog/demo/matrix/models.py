@@ -39,6 +39,25 @@ EVENT_GROUP_IDENTIFY = "$groupidentify"
 
 PROPERTY_GEOIP_COUNTRY_CODE = "$geoip_country_code"
 
+# Properties who get `$set_once` implicitly as `$initial_foo` - source of truth in plugin-server/src/utils/db/utils.ts
+PROPERTIES_WITH_IMPLICIT_INITIAL_VALUE_TRACKING = {
+    "utm_source",
+    "utm_medium",
+    "utm_campaign",
+    "utm_content",
+    "utm_term",
+    "gclid",
+    "fbclid",
+    "$browser",
+    "$browser_version",
+    "$device_type",
+    "$current_url",
+    "$pathname",
+    "$os",
+    "$referring_domain",
+    "$referrer",
+}
+
 Properties = Dict[str, Any]
 SP = TypeVar("SP", bound="SimPerson")
 Effect = Callable[[SP], Any]
@@ -47,7 +66,7 @@ Effect = Callable[[SP], Any]
 class SimSessionIntent(Enum):
     """An enumeration of session intents.
 
-    An intent is determined for each session a user starts, and it dictates their behavior during that session."""
+    An intent is determined for each session a user starts, and it informs their behavior during that session."""
 
     pass
 
@@ -57,6 +76,7 @@ class SimEvent:
     """A simulated event."""
 
     event: str
+    distinct_id: str
     properties: Properties
     timestamp: dt.datetime
 
@@ -70,27 +90,133 @@ class SimEvent:
         return display
 
 
-@dataclass
-class SimWebClient:
-    """A client (i.e. browser), one of one or many used by a single person."""
+class SimBrowserClient:
+    """A browser client, which enables client-side tracking simulation."""
 
+    # Parent
+    person: "SimPerson"
+
+    # Properties
     device_id: str
     device_type: str
     os: str
     browser: str
 
+    # State
     active_distinct_id: str
-    active_session_id: str
+    active_session_id: Optional[str]
+    super_properties: Properties
+    current_url: Optional[str]
+    is_logged_in: bool
 
-    def __init__(self, *, device_id: str, device_type: str, os: str, browser: str):
-        self.device_id = device_id
-        self.device_type = device_type
-        self.os = os
-        self.browser = browser
-        self.active_distinct_id = device_id
+    def __init__(self, person: "SimPerson"):
+        self.person = person
+        self.device_type, self.os, self.browser = person.cluster.properties_provider.device_type_os_browser()
+        self.device_id = str(UUID(int=person.cluster.random.getrandbits(128)))
+        self.active_distinct_id = self.device_id  # Pre-`$identify`, the device ID is used as the distinct ID
+        self.active_session_id = None
+        self.super_properties = {}
+        self.current_url = None
+        self.is_logged_in = True
 
-    def start_session(self, id: str):
-        self.active_session_id = id
+    def __enter__(self):
+        """Start session within client."""
+        self.active_session_id = str(self.person.roll_uuidt())
+
+    def __exit__(self, exc_type, exc_value, exc_traceback):
+        """End session within client. Handles `$pageleave` event."""
+        if self.current_url is not None:
+            self.capture(EVENT_PAGELEAVE)
+            self.current_url = None
+
+    def capture(self, event: str, properties: Optional[Properties] = None):
+        """Capture an arbitrary event. Similar to JS `posthog.capture()`."""
+        combined_properties: Properties = {
+            "$distinct_id": self.active_distinct_id,
+            "$lib": "web",
+            "$device_type": self.device_type,
+            "$os": self.os,
+            "$browser": self.browser,
+            "$session_id": self.active_session_id,
+            "$device_id": self.device_id,
+            "$groups": self.person._groups.copy(),
+            "$timestamp": self.person.simulation_time.isoformat(),
+            "$time": self.person.simulation_time.timestamp(),
+        }
+        if self.super_properties:
+            combined_properties.update(self.super_properties)
+        if self.current_url is not None:
+            parsed_current_url = urlparse(self.current_url)
+            combined_properties["$current_url"] = self.current_url
+            combined_properties["$host"] = parsed_current_url.netloc
+            combined_properties["$pathname"] = parsed_current_url.path
+        if "$set" not in combined_properties:
+            combined_properties["$set"] = {}
+        if properties:
+            if referrer := properties.get("$referrer"):
+                referring_domain = urlparse(referrer).netloc if referrer != "$direct" else referrer
+                referrer_properties = {"$referrer": referrer, "$referring_domain": referring_domain}
+                self.register(referrer_properties)
+                combined_properties["$set"].update(referrer_properties)
+                combined_properties["$referring_domain"] = referring_domain
+            combined_properties.update(properties)
+        # GeoIP
+        combined_properties[PROPERTY_GEOIP_COUNTRY_CODE] = self.person.country_code
+        combined_properties["$set"][PROPERTY_GEOIP_COUNTRY_CODE] = self.person.country_code
+        if feature_flags := self.person.decide_feature_flags():
+            for flag_key, flag_value in feature_flags.items():
+                combined_properties[f"$feature/{flag_key}"] = flag_value
+        # Saving
+        self.person._append_event(event, distinct_id=self.active_distinct_id, properties=combined_properties or {})
+
+    def capture_pageview(
+        self, current_url: str, properties: Optional[Properties] = None, *, referrer: Optional[str] = None
+    ):
+        """Capture a $pageview event. $pageleave is handled implicitly."""
+        if self.current_url is not None:
+            self.capture(EVENT_PAGELEAVE)
+        self.person.advance_timer(self.person.cluster.random.uniform(0.05, 0.3))  # A page doesn't load instantly
+        self.current_url = current_url
+        self.capture(EVENT_PAGEVIEW, properties)
+
+    def identify(self, distinct_id: Optional[str], set_properties: Optional[Properties] = None):
+        """Identify person in active client. Similar to JS `posthog.identify()`.
+
+        Use with distinct_id=None for `posthog.people.set()`-like behavior."""
+        if set_properties is None:
+            set_properties = {}
+        identify_properties = {"$distinct_id": self.active_distinct_id, "$set": set_properties}
+        if distinct_id:
+            self.is_logged_in = True
+            if self.device_id == self.active_distinct_id:
+                identify_properties["$anon_distinct_id"] = self.device_id
+            identify_properties["$user_id"] = distinct_id
+            self.active_distinct_id = distinct_id
+        self.capture(EVENT_IDENTIFY, identify_properties)
+
+    def reset(self):
+        """Reset active client, for instance when the user logs out. Similar to JS `posthog.reset()`."""
+        self.active_distinct_id = self.device_id
+        self.is_logged_in = True
+
+    def register(self, super_properties: Properties):
+        """Register super properties. Similar to JS `posthog.register()`."""
+        self.super_properties.update(super_properties)
+
+    def unregister(self, *super_property_keys: str):
+        """Removes super properties. Similar to JS `posthog.unregister()`."""
+        for key in super_property_keys:
+            self.super_properties.pop(key)
+
+    def group(self, group_type: str, group_key: str, set_properties: Optional[Properties] = None):
+        """Link the person to the specified group. Similar to JS `posthog.group()`."""
+        if set_properties is None:
+            set_properties = {}
+        self.person._groups[group_type] = group_key
+        self.person.cluster.matrix._update_group(group_type, group_key, set_properties)
+        self.capture(
+            EVENT_GROUP_IDENTIFY, {"$group_type": group_type, "$group_key": group_key, "$group_set": set_properties}
+        )
 
 
 class SimPerson(ABC):
@@ -116,14 +242,14 @@ class SimPerson(ABC):
     properties_at_now: Properties
 
     # Internal state
-    _simulation_time: dt.datetime  # Current simulation time, populated by running .simulate()
-    _active_client: SimWebClient  # Client used by person
-    _super_properties: Properties
+    finito: bool  # Whether this person has been simulated to completion
+    simulation_time: dt.datetime  # Current simulation time, populated by running .simulate()
+    active_client: SimBrowserClient  # Client being used by person
+    pageview_counts: DefaultDict[str, int]  # Pageview counts, for each URL
+    active_session_intent: SimSessionIntent
     _groups: Dict[str, str]
     _distinct_ids: Set[str]
     _properties: Properties
-    _current_pageview_kwargs: Optional[Dict[str, Any]]
-    _pageview_count: DefaultDict[str, int]
 
     @abstractmethod
     def __init__(self, *, kernel: bool, cluster: "Cluster", x: int, y: int):
@@ -134,13 +260,10 @@ class SimPerson(ABC):
         self.cluster = cluster
         self.x = x
         self.y = y
-        device_type, os, browser = self.cluster.properties_provider.device_type_os_browser()
-        self._active_client = SimWebClient(
-            device_id=str(UUID(int=self.cluster.random.getrandbits(128))),
-            device_type=device_type,
-            os=os,
-            browser=browser,
-        )
+        self.finito = False
+        self.active_client = SimBrowserClient(self)
+        self.pageview_counts = defaultdict(int)
+        self._groups = {}
         self._distinct_ids = set()
         self._properties = {}
 
@@ -168,21 +291,18 @@ class SimPerson(ABC):
         """Synchronously simulate this person's behavior for the whole duration of the simulation."""
         if hasattr(self, "simulation_time"):
             raise Exception(f"Person {self} already has been simulated")
-        self._simulation_time = self.cluster.start.astimezone(pytz.timezone(self.timezone))
-        self._current_pageview_kwargs = None
-        self._pageview_counts = defaultdict(int)
-        self._groups = {}
-        self._super_properties = {}
-        self._distinct_ids.add(self._active_client.device_id)
-        while self._simulation_time <= self.cluster.end:
-            self._simulation_time = self._fast_forward_to_next_session()
-            self._current_session_intent = self._determine_session_intent()
+        self.simulation_time = self.cluster.start.astimezone(pytz.timezone(self.timezone))
+        self._distinct_ids.add(self.active_client.device_id)
+        while self.simulation_time <= self.cluster.end:
+            self.simulation_time = self.fast_forward_to_next_session()
             self._apply_due_effects()
-            self._active_client.start_session(str(self.roll_uuidt()))
-            self._simulate_session()
-            if self._current_pageview_kwargs is not None:  # Let's assume the page is always left at the end
-                self._capture(EVENT_PAGELEAVE, **self._current_pageview_kwargs)
-                self._current_pageview_kwargs = None
+            if new_session_intent := self.determine_session_intent():
+                self.active_session_intent = new_session_intent
+            else:
+                continue  # If there's no sensible intent at the moment, let's skip ahead
+            with self.active_client:
+                self.simulate_session()
+        self.finito = True
 
     def schedule_effect(self, timestamp: dt.datetime, effect: Effect):
         """Schedule an effect to apply at a given time.
@@ -192,172 +312,99 @@ class SimPerson(ABC):
 
     # Abstract methods
 
+    def decide_feature_flags(self) -> Dict[str, Any]:
+        """Determine feature flags in force at present."""
+        return {}
+
     @abstractmethod
-    def _fast_forward_to_next_session(self) -> dt.datetime:
+    def fast_forward_to_next_session(self) -> dt.datetime:
         """Intelligently advance timer to the time of the next session."""
         raise NotImplementedError()
 
     @abstractmethod
-    def _determine_session_intent(self) -> SimSessionIntent:
+    def determine_session_intent(self) -> Optional[SimSessionIntent]:
         """Determine the session intent for the session that's about to start."""
         raise NotImplementedError()
 
     @abstractmethod
-    def _simulate_session(self):
+    def simulate_session(self):
         """Simulate a single session based on current agent state. This is how subclasses can define user behavior."""
         raise NotImplementedError()
 
     # Neighbor state
 
-    def _affect_neighbors(self, effect: Effect):
+    def affect_neighbors(self, effect: Effect):
         """Schedule the provided effect lambda for all neighbors.
 
-        Because agents are currently simulated synchronously, the effect will only work on those who
-        haven't been simulated yet, but that's OK - the results are interesting this way too.
+        Because agents are simulated synchronously, the effect will only apply to neighbors who haven't been
+        simulated yet, but that's OK - the results are interesting this way too.
         """
-        for neighbor in self.cluster._list_neighbors(self.x, self.y):
-            neighbor.schedule_effect(self._simulation_time, effect)
+        for neighbor in self.cluster._list_amenable_neighbors(self.x, self.y):
+            neighbor.schedule_effect(self.simulation_time, effect)
 
     # Person state
 
-    def _set_attribute(self, attr: str, value: Any) -> Literal[True]:
-        """Set the person's attribute. Useful for defining effects. Chain with `and`."""
+    def advance_timer(self, seconds: float):
+        """Advance simulation time by the given amount of time."""
+        self.simulation_time += dt.timedelta(seconds=seconds)
+        if not hasattr(self, "distinct_ids_at_now") and self.simulation_time >= self.cluster.now:
+            # If we've just reached matrix's `now``, take a snapshot of the current state
+            self._take_snapshot_at_now()
+
+    def set_attribute(self, attr: str, value: Any) -> Literal[True]:
+        """Set the person's attribute.
+
+        Useful for defining effects,which are lambdas. Chain them with `and`."""
         setattr(self, attr, value)
         return True
 
-    def _move_needle(self, attr: str, delta: float) -> Literal[True]:
-        """Move the person's attribute by the given delta. Useful for defining effects. Chain with `and`."""
+    def move_attribute(self, attr: str, delta: float) -> Literal[True]:
+        """Move the person's attribute by the given delta.
+
+        Useful for defining effects, which are lambdas. Chain them with `and`."""
         setattr(self, attr, getattr(self, attr) + delta)
         return True
 
     def _apply_due_effects(self):
+        """Apply all effects that are due at the current time."""
         while True:
-            if not self.scheduled_effects or self.scheduled_effects[0][0] > self._simulation_time:
+            if not self.scheduled_effects or self.scheduled_effects[0][0] > self.simulation_time:
                 break
             _, effect = self.scheduled_effects.popleft()
             effect(self)
 
-    def _advance_timer(self, seconds: float):
-        """Advance simulation time by the given amount of time."""
-        self._simulation_time += dt.timedelta(seconds=seconds)
+    def _append_event(self, event: str, *, distinct_id: str, properties: Properties):
+        """Append event to `past_events` or `future_events`, whichever is appropriate."""
+        sim_event = SimEvent(
+            event=event, distinct_id=distinct_id, properties=properties, timestamp=self.simulation_time
+        )
+        appropriate_events = self.future_events if sim_event.timestamp > self.cluster.now else self.past_events
+        appropriate_events.append(sim_event)
+        self._distinct_ids.add(distinct_id)
+        if event == EVENT_PAGEVIEW:
+            self.pageview_counts[properties["$current_url"]] += 1
+        # $set/$set_once processing
+        set_properties = properties.get("$set")
+        set_once_properties = properties.get("$set_once", {})
+        if set_properties:
+            for key, value in set_properties.items():
+                if key in PROPERTIES_WITH_IMPLICIT_INITIAL_VALUE_TRACKING:
+                    set_once_properties[f"$initial_{key.replace('$', '')}"] = value
+        if set_once_properties:
+            for key, value in set_once_properties.items():
+                if key not in self._properties:
+                    self._properties[key] = value
+        if set_properties:
+            self._properties.update(set_properties)
 
     def _take_snapshot_at_now(self):
         """Take a snapshot of person state at simulation `now` time, for dividing past and future events."""
         self.distinct_ids_at_now = self._distinct_ids.copy()
         self.properties_at_now = deepcopy(self._properties)
 
-    # Analyics
-
-    def _capture(
-        self, event: str, properties: Optional[Properties] = None, *, referrer: Optional[str] = None,
-    ):
-        """Capture an arbitrary event. Similar to JS `posthog.capture()`."""
-        if self._simulation_time > self.cluster.now:
-            # If we've just reached matrix's now, take a snapshot of the current state
-            if not hasattr(self, "distinct_ids_at_now"):
-                self._take_snapshot_at_now()
-            events = self.future_events
-        else:
-            events = self.past_events
-
-        combined_properties: Properties = {
-            "$distinct_id": self._active_client.active_distinct_id,
-            "$lib": "web",
-            "$device_type": self._active_client.device_type,
-            "$os": self._active_client.os,
-            "$browser": self._active_client.browser,
-            "$session_id": self._active_client.active_session_id,
-            "$device_id": self._active_client.device_id,
-            "$groups": self._groups.copy(),
-            "$timestamp": self._simulation_time.isoformat(),
-            "$time": self._simulation_time.timestamp(),
-        }
-        if self._super_properties:
-            combined_properties.update(self._super_properties)
-        if self._current_pageview_kwargs is not None:
-            current_url = self._current_pageview_kwargs["current_url"]
-            parsed_current_url = urlparse(current_url)
-            combined_properties["$current_url"] = current_url
-            combined_properties["$host"] = parsed_current_url.netloc
-            combined_properties["$pathname"] = parsed_current_url.path
-        if referrer:
-            referrer_properties = {
-                "$referrer": referrer,
-                "$referring_domain": urlparse(referrer).netloc,
-            }
-            self._register(referrer_properties)
-            self._identify(self._active_client.active_distinct_id, referrer_properties)
-            combined_properties.update(referrer_properties)
-        # Application of event
-        if properties:
-            combined_properties.update(properties)
-        # GeoIP
-        if "$set" not in combined_properties:
-            combined_properties["$set"] = {}
-        combined_properties[PROPERTY_GEOIP_COUNTRY_CODE] = self.country_code
-        combined_properties["$set"][PROPERTY_GEOIP_COUNTRY_CODE] = self.country_code
-        # $set/$set_once processing
-        if combined_properties.get("$set_once"):
-            for key, value in combined_properties["$set_once"].items():
-                if key not in self._properties:
-                    self._properties[key] = value
-        if combined_properties.get("$set"):
-            self._properties.update(combined_properties["$set"])
-        # Saving
-        events.append(SimEvent(event=event, properties=combined_properties or {}, timestamp=self._simulation_time))
-
-    def _capture_pageview(
-        self, current_url: str, properties: Optional[Properties] = None, *, referrer: Optional[str] = None
-    ):
-        """Capture a $pageview event. $pageleave is handled implicitly."""
-        self._pageview_counts[current_url] += 1
-        if self._current_pageview_kwargs is not None:
-            self._capture(EVENT_PAGELEAVE, **self._current_pageview_kwargs)
-        self._advance_timer(self.cluster.random.uniform(0.05, 0.3))  # A page doesn't load instantly
-        self._current_pageview_kwargs = dict(current_url=current_url, referrer=referrer)
-        self._capture(EVENT_PAGEVIEW, properties, referrer=referrer)
-
-    def _identify(self, distinct_id: Optional[str], set_properties: Optional[Properties] = None):
-        """Identify person in active client. Similar to JS `posthog.identify()`.
-
-        Use with distinct_id=None for `posthog.people.set()`-like behavior."""
-        if set_properties is None:
-            set_properties = {}
-        identify_properties = {"$distinct_id": self._active_client.active_distinct_id, "$set": set_properties}
-        if distinct_id:
-            if self._active_client.device_id == self._active_client.active_distinct_id:
-                identify_properties["$anon_distinct_id"] = self._active_client.device_id
-            identify_properties["$user_id"] = distinct_id
-            self._active_client.active_distinct_id = distinct_id
-            self._distinct_ids.add(distinct_id)
-        self._capture(EVENT_IDENTIFY, identify_properties)
-
-    def _reset(self):
-        """Reset active client, for instance when the user logs out. Similar to JS `posthog.reset()`."""
-        self._active_client.active_distinct_id = self._active_client.device_id
-
-    def _register(self, super_properties: Properties):
-        """Register super properties. Similar to JS `posthog.register()`."""
-        self._super_properties.update(super_properties)
-
-    def _unregister(self, *super_property_keys: str):
-        """Removes super properties. Similar to JS `posthog.unregister()`."""
-        for key in super_property_keys:
-            self._super_properties.pop(key)
-
-    def _group(self, group_type: str, group_key: str, set_properties: Optional[Properties] = None):
-        """Link the person to the specified group. Similar to JS `posthog.group()`."""
-        if set_properties is None:
-            set_properties = {}
-        self._groups[group_type] = group_key
-        self.cluster.matrix.update_group(group_type, group_key, set_properties)
-        self._capture(
-            EVENT_GROUP_IDENTIFY, {"$group_type": group_type, "$group_key": group_key, "$group_set": set_properties}
-        )
-
     # Utilities
 
     def roll_uuidt(self, at_timestamp: Optional[dt.datetime] = None) -> UUIDT:
         if at_timestamp is None:
-            at_timestamp = self._simulation_time
+            at_timestamp = self.simulation_time
         return UUIDT(int(at_timestamp.timestamp() * 1000), seeded_random=self.cluster.random)
