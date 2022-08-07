@@ -132,11 +132,23 @@ class HedgeboxPlan(str, Enum):
 
 
 @dataclass
+class HedgeboxInvite:
+    id: str
+    person: "HedgeboxPerson"
+
+    def __hash__(self) -> int:
+        return hash(id)
+
+
+@dataclass
 class HedgeboxFile:
     id: str
     type: str
     size_b: int
     popularity: float
+
+    def __hash__(self) -> int:
+        return hash(id)
 
 
 @dataclass
@@ -144,7 +156,7 @@ class HedgeboxAccount:
     id: str
     team_members: Set["HedgeboxPerson"]
     plan: HedgeboxPlan = field(default=HedgeboxPlan.PERSONAL_FREE)
-    files: Dict[str, HedgeboxFile] = field(default_factory=dict)
+    files: Set[HedgeboxFile] = field(default_factory=set)
 
     @property
     def current_allowed_mb(self) -> int:
@@ -161,7 +173,7 @@ class HedgeboxAccount:
 
     @property
     def current_used_mb(self) -> int:
-        return sum(file.size_b for file in self.files.values())
+        return sum(file.size_b for file in self.files)
 
     @property
     def allocation_used_fraction(self) -> float:
@@ -188,14 +200,14 @@ class HedgeboxPerson(SimPerson):
     person_id: str
     name: str
     email: str
-    affinity: float  # 0 roughly means they won't like Hedgebox, 1 means they will
+    affinity: float  # 0 roughly means they won't like Hedgebox, 1 means they will - affects need/satisfaction deltas
     falls_into_new_signup_page_bucket: bool
     watches_marius_tech_tips: bool
 
     # Internal state - plain
     active_session_intent: Optional[HedgeboxSessionIntent]
-    invite_to_use_id: Optional[str]
-    file_to_view_id: Optional[str]
+    invite_to_use: Optional[HedgeboxInvite]
+    file_to_view: Optional[HedgeboxFile]
 
     # Internal state - bounded
     _need: float  # 0 means no need, 1 means desperate
@@ -216,8 +228,8 @@ class HedgeboxPerson(SimPerson):
             NEW_SIGNUP_PAGE_FLAG_ROLLOUT_PERCENT / 100
         )
         self.watches_marius_tech_tips = self.cluster.random.random() < 0.04
-        self.invite_to_use_id = None
-        self.file_to_view_id = None
+        self.invite_to_use = None
+        self.file_to_view = None
         min_need = (0.6 if self.kernel else 0) + self.affinity / 8
         max_need = (0.9 if self.kernel else 0.1) + self.affinity / 10
         self._need = self.cluster.random.uniform(min_need, max_need)
@@ -284,7 +296,7 @@ class HedgeboxPerson(SimPerson):
         else:
             return {}
 
-    def fast_forward_to_next_session(self) -> dt.datetime:
+    def determine_next_session_datetime(self) -> dt.datetime:
         next_session_datetime = self.simulation_time
         while True:
             next_session_datetime += dt.timedelta(
@@ -312,18 +324,19 @@ class HedgeboxPerson(SimPerson):
             # Non-kernel business users can't log in or sign up
             return None
         possible_intents_with_weights: List[Tuple[HedgeboxSessionIntent, float]] = []
-        if self.invite_to_use_id:
+        if self.invite_to_use:
             possible_intents_with_weights.append((HedgeboxSessionIntent.JOIN_TEAM, 1))
-        elif self.file_to_view_id:
+        elif self.file_to_view:
             possible_intents_with_weights.append((HedgeboxSessionIntent.VIEW_SHARED_FILE, 1))
         elif not self.has_signed_up:
-            possible_intents_with_weights.append((HedgeboxSessionIntent.CONSIDER_PRODUCT, 2),)
-            if self.watches_marius_tech_tips and not self.pageview_counts[URL_MARIUS_TECH_TIPS]:
+            if self.all_time_pageview_counts[URL_HOME] < 2:
+                possible_intents_with_weights.append((HedgeboxSessionIntent.CONSIDER_PRODUCT, 2),)
+            if self.watches_marius_tech_tips and not self.all_time_pageview_counts[URL_MARIUS_TECH_TIPS]:
                 possible_intents_with_weights.append((HedgeboxSessionIntent.CHECK_MARIUS_TECH_TIPS_LINK, 1),)
         else:
             account = cast(HedgeboxAccount, self.account)  # Must exist in this branch
             file_count = len(account.files)
-            # The more files, the more likely to go to delete/download/share rather than upload
+            # The more files, the more likely to delete/download/share rather than upload
             possible_intents_with_weights.extend(
                 [
                     (HedgeboxSessionIntent.DELETE_FILE_S, math.log10(file_count) / 8 if file_count else 0),
@@ -332,7 +345,7 @@ class HedgeboxPerson(SimPerson):
                 ]
             )
             if account.allocation_used_fraction < 0.99:
-                possible_intents_with_weights.append((HedgeboxSessionIntent.UPLOAD_FILE_S, 1))
+                possible_intents_with_weights.append((HedgeboxSessionIntent.UPLOAD_FILE_S, self.need * 3))
             if (
                 self.satisfaction > 0.5
                 and self.need > 0.7
@@ -348,14 +361,13 @@ class HedgeboxPerson(SimPerson):
                 if len(account.team_members) > 1:
                     possible_intents_with_weights.append((HedgeboxSessionIntent.REMOVE_TEAM_MEMBER, 0.025))
 
-        possible_intents, weights = zip(*possible_intents_with_weights)
-        return (
-            self.cluster.random.choices(
+        if possible_intents_with_weights:
+            possible_intents, weights = zip(*possible_intents_with_weights)
+            return self.cluster.random.choices(
                 cast(Tuple[HedgeboxSessionIntent], possible_intents), cast(Tuple[float], weights)
             )[0]
-            if possible_intents
-            else None
-        )
+        else:
+            return None
 
     def simulate_session(self):
         if self.active_session_intent == HedgeboxSessionIntent.CONSIDER_PRODUCT:
@@ -409,6 +421,22 @@ class HedgeboxPerson(SimPerson):
         self.active_client.capture_pageview(URL_HOME)
         self.advance_timer(1.8 + self.cluster.random.betavariate(1.5, 3) * 300)  # Viewing the page
         self.satisfaction += (self.cluster.random.betavariate(1.6, 1.2) - 0.5) * 0.1  # It's a somewhat nice page
+        if self.active_session_intent in (
+            HedgeboxSessionIntent.UPLOAD_FILE_S,
+            HedgeboxSessionIntent.DELETE_FILE_S,
+            HedgeboxSessionIntent.DOWNLOAD_OWN_FILE_S,
+            HedgeboxSessionIntent.SHARE_FILE,
+            HedgeboxSessionIntent.INVITE_TEAM_MEMBER,
+            HedgeboxSessionIntent.REMOVE_TEAM_MEMBER,
+            HedgeboxSessionIntent.UPGRADE_PLAN,
+            HedgeboxSessionIntent.DOWNGRADE_PLAN,
+        ):
+            self.enter_app()
+        elif not self.has_signed_up:
+            if self.need > 0.4 and self.satisfaction < 0.8 and self.all_time_pageview_counts[URL_PRICING] < 4:
+                self.visit_pricing()
+            elif self.need > 0.5 and self.satisfaction >= 0.8:
+                self.visit_sign_up()
 
     def visit_marius_tech_tips(self):
         self.active_client.capture_pageview(URL_MARIUS_TECH_TIPS)
@@ -416,17 +444,24 @@ class HedgeboxPerson(SimPerson):
         self.satisfaction += (self.cluster.random.betavariate(1.6, 1.2) - 0.5) * 0.4  # The user may be in target or not
         self.need += self.cluster.random.uniform(-0.05, 0.15)
         if self.need > 0.8 and self.satisfaction > 0:
-            if self.cluster.random.random() < 0.23:
+            if self.cluster.random.random() < 0.23 and self.all_time_pageview_counts[URL_PRICING] < 3:
                 self.visit_pricing()
-            else:
+            elif self.all_time_pageview_counts[URL_SIGNUP] < 1:
                 self.visit_sign_up()
-        elif self.need > 0.5:
+        elif self.need > 0.5 and self.all_time_pageview_counts[URL_HOME] < 4:
             self.visit_home()
 
     def visit_pricing(self):
         self.active_client.capture_pageview(URL_PRICING)
         self.advance_timer(1.2 + self.cluster.random.betavariate(1.5, 2) * 200)  # Viewing the page
         self.satisfaction += self.cluster.random.uniform(-0.05, self.affinity * 0.15)
+        if self.satisfaction > 0:
+            if self.cluster.random.random() < 0.23 and self.session_pageview_counts[URL_HOME] < 2:
+                self.visit_home()
+            else:
+                self.enter_app()
+        elif self.need > 0.5:
+            self.visit_home()
 
     def visit_sign_up(self):
         self.advance_timer(self.cluster.random.uniform(0.1, 0.2))  # Page load time
@@ -509,13 +544,26 @@ class HedgeboxPerson(SimPerson):
                 + self.cluster.random.betavariate(1.5, 1.2) * math.log10(len(cast(HedgeboxAccount, self.account).files))
             )
             if self.active_session_intent == HedgeboxSessionIntent.UPLOAD_FILE_S:
-                self.upload_file()
+                file = HedgeboxFile(
+                    id=str(self.roll_uuidt()),
+                    type=self.cluster.file_provider.mime_type(),
+                    size_b=int(self.cluster.random.betavariate(1.3, 3) * 7_000_000_000),
+                    popularity=self.cluster.random.random(),
+                )
+                self.upload_file(file)
+            elif self.active_session_intent == HedgeboxSessionIntent.DELETE_FILE_S:
+                file = self.cluster.random.choice(list(cast(HedgeboxAccount, self.account).files))
+                self.delete_file(file)
+            elif self.active_session_intent == HedgeboxSessionIntent.DOWNLOAD_OWN_FILE_S:
+                file = self.cluster.random.choice(list(cast(HedgeboxAccount, self.account).files))
+                self.visit_own_file(file)
+                # TODO
 
-    def visit_own_file(self, file_id: str):
-        pass  # TODO
+    def visit_own_file(self, file: HedgeboxFile):
+        self.active_client.capture_pageview(dyn_url_file(file.id))
 
-    def visit_shared_file(self, file_id: str):
-        self.active_client.capture_pageview(dyn_url_file(file_id))
+    def visit_shared_file(self, file: HedgeboxFile):
+        self.active_client.capture_pageview(dyn_url_file(file.id))
         # TODO
 
     def visit_account_settings(self):
@@ -530,22 +578,27 @@ class HedgeboxPerson(SimPerson):
     def visit_invite(self, invite_id: str):
         pass  # TODO
 
-    def upload_file(self):
+    def upload_file(self, file: HedgeboxFile):
         # TODO
         self.advance_timer(self.cluster.random.betavariate(2.5, 1.1) * 95)
-        file = HedgeboxFile(
-            id=str(self.roll_uuidt()),
-            type=self.cluster.file_provider.mime_type(),
-            size_b=int(self.cluster.random.betavariate(1.3, 3) * 7_000_000_000),
-            popularity=self.cluster.random.random(),
-        )
-        cast(HedgeboxAccount, self.account).files[file.id] = file
+        cast(HedgeboxAccount, self.account).files.add(file)
         self.active_client.capture(
             EVENT_UPLOADED_FILE, properties={"file_type": file.type, "file_size_b": file.size_b},
         )
         self.satisfaction += self.cluster.random.uniform(-0.19, 0.2)
         if self.satisfaction > 0.9:
             self.affect_neighbors(lambda other: other._move_needle("need", 0.05))
+
+    def delete_file(self, file: HedgeboxFile):
+        pass  # TODO
+
+    def enter_app(self):
+        if not self.has_signed_up:
+            self.visit_sign_up()
+        elif not self.active_client.is_logged_in:
+            self.visit_login()
+        else:
+            self.visit_files()
 
     def log_out(self):
         self.active_client.capture(EVENT_LOGGED_OUT)

@@ -175,7 +175,7 @@ class SimBrowserClient:
         """Capture a $pageview event. $pageleave is handled implicitly."""
         if self.current_url is not None:
             self.capture(EVENT_PAGELEAVE)
-        self.person.advance_timer(self.person.cluster.random.uniform(0.05, 0.3))  # A page doesn't load instantly
+        self.person.advance_timer(self.person.cluster.random.uniform(0.02, 0.1))  # A page doesn't load instantly
         self.current_url = current_url
         self.capture(EVENT_PAGEVIEW, properties)
 
@@ -243,10 +243,11 @@ class SimPerson(ABC):
 
     # Internal state
     finito: bool  # Whether this person has been simulated to completion
-    simulation_time: dt.datetime  # Current simulation time, populated by running .simulate()
     active_client: SimBrowserClient  # Client being used by person
-    pageview_counts: DefaultDict[str, int]  # Pageview counts, for each URL
+    all_time_pageview_counts: DefaultDict[str, int]  # Pageview count per URL across all time
+    session_pageview_counts: DefaultDict[str, int]  # Pageview count per URL across the ongoing session
     active_session_intent: SimSessionIntent
+    _simulation_time: dt.datetime  # Current simulation time, populated by running .simulate()
     _groups: Dict[str, str]
     _distinct_ids: Set[str]
     _properties: Properties
@@ -262,7 +263,8 @@ class SimPerson(ABC):
         self.y = y
         self.finito = False
         self.active_client = SimBrowserClient(self)
-        self.pageview_counts = defaultdict(int)
+        self.all_time_pageview_counts = defaultdict(int)
+        self.session_pageview_counts = defaultdict(int)
         self._groups = {}
         self._distinct_ids = set()
         self._properties = {}
@@ -294,12 +296,13 @@ class SimPerson(ABC):
         self.simulation_time = self.cluster.start.astimezone(pytz.timezone(self.timezone))
         self._distinct_ids.add(self.active_client.device_id)
         while self.simulation_time <= self.cluster.end:
-            self.simulation_time = self.fast_forward_to_next_session()
-            self._apply_due_effects()
+            next_session_datetime = self.determine_next_session_datetime()
+            self._fast_forward(next_session_datetime)
             if new_session_intent := self.determine_session_intent():
                 self.active_session_intent = new_session_intent
             else:
-                continue  # If there's no sensible intent at the moment, let's skip ahead
+                continue  # If there's no intent, let's skip ahead
+            self.session_pageview_counts.clear()
             with self.active_client:
                 self.simulate_session()
         self.finito = True
@@ -317,7 +320,7 @@ class SimPerson(ABC):
         return {}
 
     @abstractmethod
-    def fast_forward_to_next_session(self) -> dt.datetime:
+    def determine_next_session_datetime(self) -> dt.datetime:
         """Intelligently advance timer to the time of the next session."""
         raise NotImplementedError()
 
@@ -344,12 +347,22 @@ class SimPerson(ABC):
 
     # Person state
 
+    @property
+    def simulation_time(self) -> dt.datetime:
+        return self._simulation_time
+
+    @simulation_time.setter
+    def simulation_time(self, value: dt.datetime):
+        self._simulation_time = value
+        if not hasattr(self, "distinct_ids_at_now") and self.simulation_time >= self.cluster.now:
+            # If we've just reached matrix's `now`, take a snapshot of the current state
+            # for dividing past and future events
+            self.distinct_ids_at_now = self._distinct_ids.copy()
+            self.properties_at_now = deepcopy(self._properties)
+
     def advance_timer(self, seconds: float):
         """Advance simulation time by the given amount of time."""
         self.simulation_time += dt.timedelta(seconds=seconds)
-        if not hasattr(self, "distinct_ids_at_now") and self.simulation_time >= self.cluster.now:
-            # If we've just reached matrix's `now``, take a snapshot of the current state
-            self._take_snapshot_at_now()
 
     def set_attribute(self, attr: str, value: Any) -> Literal[True]:
         """Set the person's attribute.
@@ -365,13 +378,17 @@ class SimPerson(ABC):
         setattr(self, attr, getattr(self, attr) + delta)
         return True
 
-    def _apply_due_effects(self):
+    def _fast_forward(self, next_session_datetime: dt.datetime):
         """Apply all effects that are due at the current time."""
         while True:
-            if not self.scheduled_effects or self.scheduled_effects[0][0] > self.simulation_time:
+            if not self.scheduled_effects or self.scheduled_effects[0][0] > next_session_datetime:
                 break
-            _, effect = self.scheduled_effects.popleft()
-            effect(self)
+            effect_datetime, effect_lambda = self.scheduled_effects.popleft()
+            if self.simulation_time < effect_datetime:
+                self.simulation_time = effect_datetime
+            effect_lambda(self)
+        if self.simulation_time < next_session_datetime:
+            self.simulation_time = next_session_datetime
 
     def _append_event(self, event: str, *, distinct_id: str, properties: Properties):
         """Append event to `past_events` or `future_events`, whichever is appropriate."""
@@ -382,7 +399,8 @@ class SimPerson(ABC):
         appropriate_events.append(sim_event)
         self._distinct_ids.add(distinct_id)
         if event == EVENT_PAGEVIEW:
-            self.pageview_counts[properties["$current_url"]] += 1
+            self.all_time_pageview_counts[properties["$current_url"]] += 1
+            self.session_pageview_counts[properties["$current_url"]] += 1
         # $set/$set_once processing
         set_properties = properties.get("$set")
         set_once_properties = properties.get("$set_once", {})
@@ -396,11 +414,6 @@ class SimPerson(ABC):
                     self._properties[key] = value
         if set_properties:
             self._properties.update(set_properties)
-
-    def _take_snapshot_at_now(self):
-        """Take a snapshot of person state at simulation `now` time, for dividing past and future events."""
-        self.distinct_ids_at_now = self._distinct_ids.copy()
-        self.properties_at_now = deepcopy(self._properties)
 
     # Utilities
 
